@@ -16,7 +16,6 @@ set -o nounset
 # Set the Internal Field Separator
 IFS=' 	
 '
-
 # Exit with 1.
 #
 # Arguments:
@@ -39,17 +38,24 @@ usage () {
 		exit 1
 	fi
 	printf '%s' "Usage:
-${0} [-h | --help] [--workdir <workdirpath>]
+${0} [-h | --help] [--workdir <workdirpath>] [--workerdir <workerdirpath>]
 	[--branch-whitelist <whitelist>] [--branch-blacklist <blacklist>]
 	[--tag-whitelist <whitelist>] [--tag-blacklist <blacklist>]
+	[--local-branch-whitelist <whitelist>] [--local-branch-blacklist <blacklist>]
+	[--local-tag-whitelist <whitelist>] [--local-tag-blacklist <blacklist>]
 	[--tags-plan (visited|all|none)]
 	[--tags-max-history-lookup <depth>]
 	[--push-branch-format <printf-format>]
 	[--push-tag-format <printf-format>]
 	[--push-format <printf-format>]
+	[--push-local-branch-format <printf-format>]
+	[--push-local-tag-format <printf-format>]
+	[--push-local-format <printf-format>]
 	[--remote <name> <remoterepository>]
-	[--prune-branches] [--prune-tags] [--follow-tags]
-	[--no-hardlinks] [--no-atomic] [--no-lock] [--]
+	[--prune-branches] [--prune-tags]
+	[--no-hardlinks] [--no-atomic] [--no-lock]
+	[--pull-source-only]
+	[--]
 	<sourcerepository> <destinationrepository> <filters>
 	Apply git filter-branch in an incremental way
 
@@ -58,6 +64,10 @@ Where:
 --workdir workdirpath
 	set the path to the directory where the temporary local repositories are created.
 	By default, we'll use a directory named temp in the current directory.
+--workerdir workerdirpath
+	set the path to the directory where the temporary worker repository is created.
+	By default, we'll use a sub-directory of workdir with a name based on MD5 of
+	the source and destination repositories urls.
 --branch-whitelist <whitelist>
 	a whitespace-separated list of branches to be included in the process.
 	Multiple options can be specified.
@@ -74,6 +84,12 @@ Where:
 	a whitespace-separated list of tags to be excluded from the process.
 	Multiple options can be specified.
 	Blacklisted tags take the precedence over whitelisted ones.
+--local-branch-whitelist <whitelist>
+--local-branch-blacklist <blacklist>
+--local-tag-whitelist <whitelist>
+--local-tag-blacklist <blacklist>
+	Same as the non-local options above, except for pushing tags and branches that are created
+	locally by the filter scripts. Note that the filter-branch/ prefix is automatically excluded.
 --tags-plan
 	how tags should be processed. This can be one of these values:
 	- visited: process only the tags visited (default)
@@ -83,37 +99,42 @@ Where:
 	limit the depth when looking for best matched filtered commit when --tags-plan is 'all'.
 	By default this value is 50.
 --push-branch-format <printf-format>
-    formatting string (given to printf) for branches pushed to the destination repository.
-    By default this is '%s'. You can use '<prefix>%s<suffix>' to add a prefix and/or suffix.
+	formatting string (given to printf) for branches pushed to the destination repository.
+	By default this is '%s'. You can use '<prefix>%s<suffix>' to add a prefix and/or suffix.
 --push-tag-format <printf-format>
-    formatting string (given to printf) for tags pushed to the destination repository.
-    By default this is '%s'. You can use '<prefix>%s<suffix>' to add a prefix and/or suffix.
+	formatting string (given to printf) for tags pushed to the destination repository.
+	By default this is '%s'. You can use '<prefix>%s<suffix>' to add a prefix and/or suffix.
 --push-format <printf-format>
-    formatting string (given to printf) for branches and tags pushed to the destination repository.
-    This overrides both --push-branch-format and --push-tag-format.
+	formatting string (given to printf) for branches and tags pushed to the destination repository.
+	This overrides both --push-branch-format and --push-tag-format.
+--push-local-branch-format <printf-format>
+--push-local-tag-format <printf-format>
+--push-local-format <printf-format>
+	Same as the non-local options above, except for pushing tags and branches that are created
+	locally by the filter scripts.
 --remote <name> <remoterepository>
-    Add a remote with the given name that will be cloned or updated from the given URL or path
-    before applying the filter.
-    This can be used to include commits from other repositories as new parents of filtered commits.
-    Note that the filter will only be applied to branches of the source repository.
+	Add a remote with the given name that will be cloned or updated from the given URL or path
+	before applying the filter.
+	This can be used to include commits from other repositories as new parents of filtered commits.
+	Note that the filter will only be applied to branches of the source repository.
 --prune-branches
 	delete branches in the destination repository that do not exist anymore in the source repository,
 	or that do not satisfy the whitelist/blacklist.
-    If --push-branch-format or --push-format is used, only the branches matching this format will be
-    considered for pruning.
+	If --push-branch-format or --push-format is used, only the branches matching this format will be
+	considered for pruning.
 --prune-tags
 	delete tags in the destination repository that do not exist anymore in the source repository,
 	or that do not satisfy the whitelist/blacklist.
-    If --push-tag-format or --push-format is used, only the branches matching this format will be
-    considered for pruning.
---follow-tags
-    Automatically push annoted tags (from filters) that are reacheable in pushed branches.
+	If --push-tag-format or --push-format is used, only the branches matching this format will be
+	considered for pruning.
 --no-hardlinks
 	Do not create hard links (useful for file systems that don't support it).
 --no-atomic
 	Do not use an atomic transaction when pushing to the destination repository.
 --no-lock
 	Do not acquire an exclusive lock (useful for systems that don't have flock(1)).
+--pull-source-only
+	Stop after updating the local copy of the source repository and output its path
 sourcerepository
 	The URL or path to the source repository.
 destinationrepository
@@ -138,22 +159,29 @@ Please remark that these regular expressions should comply the POSIX ERE (Extend
 #   ARGS_SHIFT=the number of shifts that should be done to keep only the filter arguments
 readParameters () {
 	WORK_DIRECTORY="$(pwd)/temp"
+	WORKER_REPOSITORY_DIR=''
 	BRANCH_WHITELIST=''
 	BRANCH_BLACKLIST=''
 	TAG_WHITELIST=''
 	TAG_BLACKLIST=''
+	LOCAL_TAG_WHITELIST=''
+	LOCAL_TAG_BLACKLIST=''
+	LOCAL_BRANCH_WHITELIST=''
+	LOCAL_BRANCH_BLACKLIST=''
 	TAGS_PLAN='visited'
 	PROCESS_TAGS_MAXHISTORYLOOKUP=50
-    PUSH_BRANCH_FORMAT='%s'
-    PUSH_TAG_FORMAT='%s'
+	PUSH_BRANCH_FORMAT='%s'
+	PUSH_TAG_FORMAT='%s'
+	PUSH_LOCAL_BRANCH_FORMAT='%s'
+	PUSH_LOCAL_TAG_FORMAT='%s'
 	NO_HARDLINKS=''
 	ATOMIC='--atomic'
-    FOLLOW_TAGS=''
 	NO_LOCK=''
+	PULL_SOURCE_ONLY=0
 	PRUNE_BRANCHES=0
 	PRUNE_TAGS=0
-    REMOTES=''
-    readParameters_inputArgs=$#
+	REMOTES=''
+	readParameters_inputArgs=$#
 	while :
 	do
 		if test $# -lt 1
@@ -178,6 +206,18 @@ readParameters () {
 				if test -z "${WORK_DIRECTORY}"
 				then
 					die 'The working directory option is empty'
+				fi
+				shift 2
+				;;
+			--workerdir)
+				if test $# -lt 2
+				then
+					usage 'Not enough arguments'
+				fi
+				WORKER_REPOSITORY_DIR="${2}"
+				if test -z "${WORKER_REPOSITORY_DIR}"
+				then
+					die 'The worker repository directory option is empty'
 				fi
 				shift 2
 				;;
@@ -211,6 +251,38 @@ readParameters () {
 					usage 'Not enough arguments'
 				fi
 				TAG_BLACKLIST="${TAG_BLACKLIST} ${2}"
+				shift 2
+				;;
+			--local-branch-whitelist)
+				if test $# -lt 2
+				then
+					usage 'Not enough arguments'
+				fi
+				LOCAL_BRANCH_WHITELIST="${LOCAL_BRANCH_WHITELIST} ${2}"
+				shift 2
+				;;
+			--local-branch-blacklist)
+				if test $# -lt 2
+				then
+					usage 'Not enough arguments'
+				fi
+				LOCAL_BRANCH_BLACKLIST="${LOCAL_BRANCH_BLACKLIST} ${2}"
+				shift 2
+				;;
+			--local-tag-whitelist)
+				if test $# -lt 2
+				then
+					usage 'Not enough arguments'
+				fi
+				LOCAL_TAG_WHITELIST="${LOCAL_TAG_WHITELIST} ${2}"
+				shift 2
+				;;
+			--local-tag-blacklist)
+				if test $# -lt 2
+				then
+					usage 'Not enough arguments'
+				fi
+				LOCAL_TAG_BLACKLIST="${LOCAL_TAG_BLACKLIST} ${2}"
 				shift 2
 				;;
 			--tags-plan)
@@ -275,13 +347,38 @@ readParameters () {
 				PUSH_TAG_FORMAT="${2}"
 				shift 2
 				;;
+			--push-local-branch-format)
+				if test $# -lt 2
+				then
+					usage 'Not enough arguments'
+				fi
+				PUSH_LOCAL_BRANCH_FORMAT="${2}"
+				shift 2
+				;;
+			--push-local-tag-format)
+				if test $# -lt 2
+				then
+					usage 'Not enough arguments'
+				fi
+				PUSH_LOCAL_TAG_FORMAT="${2}"
+				shift 2
+				;;
+			--push-local-format)
+				if test $# -lt 2
+				then
+					usage 'Not enough arguments'
+				fi
+				PUSH_LOCAL_BRANCH_FORMAT="${2}"
+				PUSH_LOCAL_TAG_FORMAT="${2}"
+				shift 2
+				;;
 			--remote)
 				if test $# -lt 3
 				then
 					usage 'Not enough arguments'
 				fi
-	            readParameters_remoteURL=$(absolutizePath "${3}")
-                REMOTES="${REMOTES} ${2}:${readParameters_remoteURL}"
+				readParameters_remoteURL=$(absolutizePath "${3}")
+				REMOTES="${REMOTES} ${2}:${readParameters_remoteURL}"
 				shift 3
 				;;
 			--prune-branches)
@@ -290,10 +387,6 @@ readParameters () {
 				;;
 			--prune-tags)
 				PRUNE_TAGS=1
-				shift 1
-				;;
-			--follow-tags)
-				FOLLOW_TAGS='--follow-tags'
 				shift 1
 				;;
 			--no-hardlinks)
@@ -306,6 +399,10 @@ readParameters () {
 				;;
 			--no-lock)
 				NO_LOCK='yes'
+				shift 1
+				;;
+			--pull-source-only)
+				PULL_SOURCE_ONLY=1
 				shift 1
 				;;
 			-*)
@@ -322,9 +419,9 @@ readParameters () {
 		then
 			die "You can't use --tag-whitelist or --tag-blacklist when you specify '--tags-plan none'"
 		fi
-		if test "${PRUNE_BRANCHES}" -ne 0 -o "${PRUNE_TAGS}" -ne 0
+		if "${PRUNE_TAGS}" -ne 0
 		then
-			die "You can't use --prune-branches or --prune-tags when you specify '--tags-plan none'"
+			die "You can't use --prune-tags when you specify '--tags-plan none'"
 		fi
 	fi
 	if test $# -lt 3
@@ -354,8 +451,8 @@ readParameters () {
 		die 'The destination repository location is empty.'
 	fi
 	DESTINATION_REPOSITORY_URL=$(absolutizePath "${DESTINATION_REPOSITORY_URL}")
-    shift 2
-    ARGS_SHIFT=$((${readParameters_inputArgs} - $#))
+	shift 2
+	ARGS_SHIFT=$((${readParameters_inputArgs} - $#))
 }
 
 
@@ -469,8 +566,11 @@ initializeEnvironment () {
 		mkdir -p -- "${WORK_DIRECTORY}" || die "Failed to create the working directory ${WORK_DIRECTORY}"
 	fi
 	WORK_DIRECTORY=$(absolutizePath "${WORK_DIRECTORY}")
-	SOURCE_REPOSITORY_DIR=${WORK_DIRECTORY}/source-$(getMD5 "${SOURCE_REPOSITORY_URL}")
-	WORKER_REPOSITORY_DIR=${WORK_DIRECTORY}/worker-$(getMD5 "${SOURCE_REPOSITORY_URL}${DESTINATION_REPOSITORY_URL}")
+	SOURCE_REPOSITORY_DIR=${WORK_DIRECTORY}/source-$(getBaseName "${SOURCE_REPOSITORY_URL}")-$(getMD5 "${SOURCE_REPOSITORY_URL}")
+	if test -z "${WORKER_REPOSITORY_DIR}"
+	then
+		WORKER_REPOSITORY_DIR=${WORK_DIRECTORY}/worker-$(getBaseName "${SOURCE_REPOSITORY_URL}")-$(getBaseName "${DESTINATION_REPOSITORY_URL}")-$(getMD5 "${SOURCE_REPOSITORY_URL}${DESTINATION_REPOSITORY_URL}")
+	fi
 }
 
 
@@ -491,23 +591,34 @@ acquireLock () {
 }
 
 
-# Create or update the mirror of the source repository.
-prepareLocalSourceRepository () {
-	prepareLocalSourceRepository_haveToCreateMirror=1
-	if test -f "${SOURCE_REPOSITORY_DIR}/config"
+# Create or update the mirror of a repository.
+#
+# Arguments:
+#   $1: the repository url
+#   $2: the repository dir
+prepareLocalRepository () {
+	prepareLocalRepository_URL="$1"
+	prepareLocalRepository_DIR="$2"
+	prepareLocalRepository_haveToCreateMirror=1
+	if test -f "${prepareLocalRepository_DIR}/config"
 	then
-		echo '# Updating source repository'
-		if git -C "${SOURCE_REPOSITORY_DIR}" remote update --prune
+		echo "# Updating repository ${prepareLocalRepository_URL}"
+		if git -C "${prepareLocalRepository_DIR}" remote update --prune
 		then
-			prepareLocalSourceRepository_haveToCreateMirror=0
+			prepareLocalRepository_haveToCreateMirror=0
 		fi
 	fi
-	if test ${prepareLocalSourceRepository_haveToCreateMirror} -eq 1
+	if test ${prepareLocalRepository_haveToCreateMirror} -eq 1
 	then
-		echo '# Cloning source repository'
-		rm -rf "${SOURCE_REPOSITORY_DIR}"
-		git clone --mirror "${SOURCE_REPOSITORY_URL}" "${SOURCE_REPOSITORY_DIR}"
+		echo "# Cloning repository ${prepareLocalRepository_URL}"
+		rm -rf "${prepareLocalRepository_DIR}"
+		git clone --mirror "${prepareLocalRepository_URL}" "${prepareLocalRepository_DIR}"
 	fi
+}
+
+# Create or update the mirror of the source repository.
+prepareLocalSourceRepository () {
+	prepareLocalRepository "${SOURCE_REPOSITORY_URL}" "${SOURCE_REPOSITORY_DIR}"
 }
 
 
@@ -548,6 +659,19 @@ getTagList () {
 	git -C "${1}" show-ref --tags | sed -E 's:^.* refs/tags/::' || true
 }
 
+# Get the list of all branches that exist in a repository
+#
+# Arguments:
+#   $1: the directory of the repository
+#
+# Output:
+#   The list of branches (one per line)
+getBranchList () {
+	# List all branches and takes only the part after "refs/heads/"
+	git -C "${1}" show-ref --heads | sed -E 's:^.* refs/heads/::' || true
+}
+
+
 # Get the branch name to push to the destination for a source branch
 #
 # Arguments:
@@ -556,7 +680,7 @@ getTagList () {
 # Output:
 #   The name of the destination branch
 getPushBranch () {
-    printf "${PUSH_BRANCH_FORMAT}" "${1}"
+	printf "${PUSH_BRANCH_FORMAT}" "${1}"
 }
 
 # Get the tag name to push to the destination for a source tag
@@ -567,7 +691,29 @@ getPushBranch () {
 # Output:
 #   The name of the destination tag
 getPushTag () {
-    printf "${PUSH_TAG_FORMAT}" "${1}"
+	printf "${PUSH_TAG_FORMAT}" "${1}"
+}
+
+# Get the branch name to push to the destination for a local branch
+#
+# Arguments:
+#   $1: the name of the source branch
+#
+# Output:
+#   The name of the destination branch
+getPushLocalBranch () {
+	printf "${PUSH_LOCAL_BRANCH_FORMAT}" "${1}"
+}
+
+# Get the tag name to push to the destination for a local tag
+#
+# Arguments:
+#   $1: the name of the source tag
+#
+# Output:
+#   The name of the destination tag
+getPushLocalTag () {
+	printf "${PUSH_LOCAL_TAG_FORMAT}" "${1}"
 }
 
 # Check if a string is in a white/black list.
@@ -693,32 +839,35 @@ prepareWorkerRepository () {
 # Add or update remote repositories asked for by the user
 prepareRemotes () {
 	set +o errexit
-    prepareRemotes_workerRemotes=$(git -C "${WORKER_REPOSITORY_DIR}" remote)
-    for prepareRemotes_remoteNameURL in ${REMOTES}
-    do
-        prepareRemotes_remote="${prepareRemotes_remoteNameURL%%:*}"
-        prepareRemotes_url="${prepareRemotes_remoteNameURL#*:}"
-        if itemInList "${prepareRemotes_remote}" "${prepareRemotes_workerRemotes}"; then
-		    echo "# Setting remote repository \"${prepareRemotes_remote}\" url to \"${prepareRemotes_url}\""
-            git -C "${WORKER_REPOSITORY_DIR}" remote set-url "${prepareRemotes_remote}" "${prepareRemotes_url}"
-        else
-		    echo "# Adding remote repository \"${prepareRemotes_remote}\" with url \"${prepareRemotes_url}\""
-            git -C "${WORKER_REPOSITORY_DIR}" remote add "${prepareRemotes_remote}" "${prepareRemotes_url}"
-        fi
+	prepareRemotes_workerRemotes=$(git -C "${WORKER_REPOSITORY_DIR}" remote)
+	for prepareRemotes_remoteNameURL in ${REMOTES}
+	do
+		prepareRemotes_remote="${prepareRemotes_remoteNameURL%%:*}"
+		prepareRemotes_URL="${prepareRemotes_remoteNameURL#*:}"
+		prepareRemotes_DIR=${WORK_DIRECTORY}/source-$(getBaseName "${prepareRemotes_URL}")-$(getMD5 "${prepareRemotes_URL}")
+		prepareLocalRepository "${prepareRemotes_URL}" "${prepareRemotes_DIR}"
+
+		if itemInList "${prepareRemotes_remote}" "${prepareRemotes_workerRemotes}"; then
+			echo "# Setting remote repository \"${prepareRemotes_remote}\" from \"${prepareRemotes_URL}\""
+			git -C "${WORKER_REPOSITORY_DIR}" remote set-url "${prepareRemotes_remote}" "${prepareRemotes_DIR}"
+		else
+			echo "# Adding remote repository \"${prepareRemotes_remote}\" from \"${prepareRemotes_URL}\""
+			git -C "${WORKER_REPOSITORY_DIR}" remote add "${prepareRemotes_remote}" "${prepareRemotes_DIR}"
+		fi
 		echo "# Fetching data from remote repository \"${prepareRemotes_remote}\""
-        git -C "${WORKER_REPOSITORY_DIR}" fetch --prune "${prepareRemotes_remote}"
-    done
+		git -C "${WORKER_REPOSITORY_DIR}" fetch --prune "${prepareRemotes_remote}"
+	done
 }
 
-
 # Process a branch, fetching it from the mirror of the source repository.
+# Note that this no longer calls git filter-branch, this is now done once for all branches in processBranches.
 # Any relevant tag will also be processed.
 #
 # Arguments:
 #   $1: the name of the branch to work with
 processBranch () {
-    processBranch_branch="${1}"
-    shift 1
+	processBranch_branch="${1}"
+	shift 1
 	echo '  - fetching'
 	git -C "${WORKER_REPOSITORY_DIR}" fetch --update-shallow --quiet --tags source "${processBranch_branch}"
 	echo '  - setting current branch'
@@ -737,10 +886,10 @@ processBranch () {
 		echo '  - nothing new, skipping'
 	else
 		echo '  - initializing filter'
-		rm -f "${WORKER_REPOSITORY_DIR}/refs/filter-branch/originals/${processBranch_branch}/refs/heads/filter-branch/result/${processBranch_branch}"
+		rm -f "${WORKER_REPOSITORY_DIR}/refs/filter-branch/originals/refs/heads/filter-branch/result/${processBranch_branch}"
+		git -C "${WORKER_REPOSITORY_DIR}" branch --force "filter-branch/filtering/${processBranch_branch}" FETCH_HEAD
 		git -C "${WORKER_REPOSITORY_DIR}" branch --force "filter-branch/result/${processBranch_branch}" FETCH_HEAD
-		rm -rf "${WORKER_REPOSITORY_DIR}.filter-branch"
-		echo "  - filtering commits"
+		echo "  - preparing filtering commits"
 		processBranch_tags=''
 		if test -z "${TAGS_PLAN}"
 		then
@@ -748,65 +897,25 @@ processBranch () {
 		else
 			processBranch_tags=$(getSourceRepositoryTagsInBranch "${processBranch_branch}")
 		fi
-		if test -z "${processBranch_tags}"
+		PROCESS_RANGES="${PROCESS_RANGES} ${processBranch_range}"
+		PROCESS_BRANCHES="${PROCESS_BRANCHES} ${processBranch_branch}"
+		if test -n "${processBranch_tags}"
 		then
-			processBranch_tagNameFilter=''
-		else
-			# shellcheck disable=SC2016
-			processBranch_tagNameFilter='read -r tag; printf "filter-branch/converted-tags/%s" "${tag}"'
+			PROCESS_TAGS="${PROCESS_TAGS} ${processBranch_tags}"
 		fi
-		rm -rf "${WORKER_REPOSITORY_DIR}.map"
-		set +o errexit
-        #set -o xtrace
-		# shellcheck disable=SC2086
-		git -C "${WORKER_REPOSITORY_DIR}" filter-branch \
-			"$@" \
-			--remap-to-ancestor \
-			--tag-name-filter "${processBranch_tagNameFilter}" \
-			-d "${WORKER_REPOSITORY_DIR}.filter-branch" \
-			--original "refs/filter-branch/originals/${processBranch_branch}" \
-			--state-branch "refs/filter-branch/state" \
-			--force \
-			-- "${processBranch_range}" \
-			2>"${WORKER_REPOSITORY_DIR}.stderr"
-		processBranch_rc=$?
-		#set +o xtrace
-		set -o errexit
-		if test -s "${WORKER_REPOSITORY_DIR}.stderr"
-		then
-			cat "${WORKER_REPOSITORY_DIR}.stderr" >&2
-			if test ${processBranch_rc} -eq 1
-			then
-				if test -n "$(cat "${WORKER_REPOSITORY_DIR}.stderr" | grep -E '^Found nothing to rewrite$')"
-				then
-					processBranch_rc=2
-				fi
-			fi
-		fi
-		if test ${processBranch_rc} -ne 0 -a ${processBranch_rc} -ne 2
-		then
-			die 'git failed'
-		fi
-		if test "${TAGS_PLAN}" = 'all' -a -n "${processBranch_tags}"
-		then
-			if ! processBranchTag_availableTags="$(git -C "${WORKER_REPOSITORY_DIR}" tag --list | grep -E '^filter-branch/converted-tags/' | sed -E 's:^filter-branch/converted-tags/::')"
-			then
-				processBranchTag_availableTags=''
-			fi
-			for processBranch_tag in ${processBranch_tags}
-			do
-				if ! itemInList "${processBranch_tag}" "${processBranchTag_availableTags}"
-				then
-					if stringPassesLists "${processBranch_tag}" "${TAG_WHITELIST}" "${TAG_BLACKLIST}"
-					then
-						processNotConvertedTag "${processBranch_tag}"
-					fi
-				fi
-			done
-		fi
-		echo "  - storing state"
-		git -C "${WORKER_REPOSITORY_DIR}" branch -f "filter-branch/filtered/${processBranch_branch}" FETCH_HEAD
 	fi
+}
+
+# Process a branch, fetching it from the mirror of the source repository.
+# Any relevant tag will also be processed.
+#
+# Arguments:
+#   $1: the name of the branch to work with
+processBranchFinalize () {
+	processBranchFinalize_branch="${1}"
+	processBranchFinalize_fetchHead=$(git -C "${WORKER_REPOSITORY_DIR}" rev-parse "filter-branch/filtering/${processBranchFinalize_branch}")
+	git -C "${WORKER_REPOSITORY_DIR}" branch -f "filter-branch/filtered/${processBranchFinalize_branch}" "${processBranchFinalize_fetchHead}"
+	git -C "${WORKER_REPOSITORY_DIR}" branch -D "filter-branch/filtering/${processBranchFinalize_branch}"
 }
 
 
@@ -898,18 +1007,97 @@ removeTranslatedTags () {
 # Process all the branches listed in the WORK_BRANCHES variable, and push the result to the destination repository.
 processBranches () {
 	processBranches_pushRefSpec=''
+
+	PROCESS_RANGES=""
+	PROCESS_BRANCHES=""
+	PROCESS_TAGS=""
+
 	for processBranches_branch in ${WORK_BRANCHES}
 	do
-		processBranches_pushBranch=$(getPushBranch "${processBranches_branch}")
-        if test "${processBranches_branch}" != "${processBranches_pushBranch}"
-        then
-		    echo "# Processing branch ${processBranches_branch} to ${processBranches_pushBranch}"
-        else
-		    echo "# Processing branch ${processBranches_branch}"
-        fi
+		echo "# Prepare processing of branch ${processBranches_branch}"
 		processBranch "${processBranches_branch}" "$@"
-		processBranches_pushRefSpec="${processBranches_pushRefSpec} filter-branch/result/${processBranches_branch}:${processBranches_pushBranch}"
 	done
+
+	if test -n "${PROCESS_BRANCHES}"
+	then
+		echo "# Filtering commits for branches ${PROCESS_BRANCHES}"
+		rm -rf "${WORKER_REPOSITORY_DIR}.filter-branch"
+
+		processBranches_tags="${PROCESS_TAGS}"
+		if test -z "${processBranches_tags}"
+		then
+			processBranches_tagNameFilter=''
+		else
+			# shellcheck disable=SC2016
+			processBranches_tagNameFilter='read -r tag; printf "filter-branch/converted-tags/%s" "${tag}"'
+		fi
+		rm -rf "${WORKER_REPOSITORY_DIR}.map"
+		set +o errexit
+		#set -o xtrace
+		# shellcheck disable=SC2086
+		git -C "${WORKER_REPOSITORY_DIR}" filter-branch \
+			"$@" \
+			--remap-to-ancestor \
+			--tag-name-filter "${processBranches_tagNameFilter}" \
+			-d "${WORKER_REPOSITORY_DIR}.filter-branch" \
+			--original "refs/filter-branch/originals" \
+			--state-branch "refs/filter-branch/state" \
+			--force \
+			-- ${PROCESS_RANGES} \
+			2>"${WORKER_REPOSITORY_DIR}.stderr"
+		processBranches_rc=$?
+		#set +o xtrace
+		set -o errexit
+		if test -s "${WORKER_REPOSITORY_DIR}.stderr"
+		then
+			cat "${WORKER_REPOSITORY_DIR}.stderr" >&2
+			if test ${processBranches_rc} -eq 1
+			then
+				if test -n "$(cat "${WORKER_REPOSITORY_DIR}.stderr" | grep -E '^Found nothing to rewrite$')"
+				then
+					processBranches_rc=2
+				fi
+			fi
+		fi
+		if test ${processBranches_rc} -ne 0 -a ${processBranches_rc} -ne 2
+		then
+			die 'git failed'
+		fi
+		if test "${TAGS_PLAN}" = 'all' -a -n "${processBranches_tags}"
+		then
+			if ! processBranchTag_availableTags="$(git -C "${WORKER_REPOSITORY_DIR}" tag --list | grep -E '^filter-branch/converted-tags/' | sed -E 's:^filter-branch/converted-tags/::')"
+			then
+				processBranchTag_availableTags=''
+			fi
+			for processBranches_tag in ${processBranches_tags}
+			do
+				if ! itemInList "${processBranches_tag}" "${processBranchTag_availableTags}"
+				then
+					if stringPassesLists "${processBranches_tag}" "${TAG_WHITELIST}" "${TAG_BLACKLIST}"
+					then
+						processNotConvertedTag "${processBranches_tag}"
+					fi
+				fi
+			done
+		fi
+	fi
+
+	for processBranches_branch in ${PROCESS_BRANCHES}
+	do
+		processBranches_pushBranch=$(getPushBranch "${processBranches_branch}")
+		processBranches_filteredBranch="filter-branch/result/${processBranches_branch}"
+		if git -C "${WORKER_REPOSITORY_DIR}" rev-parse --verify -q "${processBranches_filteredBranch}"; then
+			if test "${processBranches_branch}" != "${processBranches_pushBranch}"
+			then
+				echo "# Pushing processed branch ${processBranches_branch} to ${processBranches_pushBranch}"
+			else
+				echo "# Pushing processed branch ${processBranches_branch}"
+			fi
+			processBranches_pushRefSpec="${processBranches_pushRefSpec} ${processBranches_filteredBranch}:${processBranches_pushBranch}"
+		fi
+		processBranchFinalize "${processBranches_branch}" "$@"
+	done
+
 	if test -n "${TAGS_PLAN}"
 	then
 		echo '# Listing source tags'
@@ -917,20 +1105,69 @@ processBranches () {
 		echo '# Determining destination tags'
 		for processBranches_sourceTag in ${processBranches_sourceTags}
 		do
-            processBranches_pushTag=$(getPushTag "${processBranches_sourceTag}")
+			processBranches_pushTag=$(getPushTag "${processBranches_sourceTag}")
 			if stringPassesLists "${processBranches_sourceTag}" "${TAG_WHITELIST}" "${TAG_BLACKLIST}"
 			then
 				processBranches_rewrittenTag="filter-branch/converted-tags/${processBranches_sourceTag}"
 				if git -C "${WORKER_REPOSITORY_DIR}" rev-list --max-count=0 "${processBranches_rewrittenTag}" 2>/dev/null
 				then
+					if test "${processBranches_sourceTag}" != "${processBranches_pushTag}"
+					then
+						echo "# Pushing processed tag ${processBranches_sourceTag} to ${processBranches_pushTag}"
+					else
+						echo "# Pushing processed tag ${processBranches_sourceTag}"
+					fi
 					processBranches_pushRefSpec="${processBranches_pushRefSpec} ${processBranches_rewrittenTag}:${processBranches_pushTag}"
 				fi
 			fi
 		done
 	fi
-	echo "# Pushing to destination repository"
-	# shellcheck disable=SC2086
-	git -C "${WORKER_REPOSITORY_DIR}" push --quiet --force ${ATOMIC} ${FOLLOW_TAGS} destination ${processBranches_pushRefSpec}
+	if test -n "${LOCAL_TAG_WHITELIST}" -o -n "${LOCAL_TAG_BLACKLIST}"
+	then
+		echo '# Listing local tags'
+		processBranches_localTags=$(getTagList "${WORKER_REPOSITORY_DIR}")
+		echo '# Determining destination tags'
+		for processBranches_localTag in ${processBranches_localTags}
+		do
+			processBranches_pushTag=$(getPushLocalTag "${processBranches_localTag}")
+			if stringPassesLists "${processBranches_localTag}" "${LOCAL_TAG_WHITELIST}" "${LOCAL_TAG_BLACKLIST} rx:filter-branch/.*"
+			then
+				if test "${processBranches_localTag}" != "${processBranches_pushTag}"
+				then
+					echo "# Pushing local tag ${processBranches_localTag} to ${processBranches_pushTag}"
+				else
+					echo "# Pushing local tag ${processBranches_localTag}"
+				fi
+				processBranches_pushRefSpec="${processBranches_pushRefSpec} ${processBranches_localTag}:${processBranches_pushTag}"
+			fi
+		done
+	fi
+	if test -n "${LOCAL_BRANCH_WHITELIST}" -o -n "${LOCAL_BRANCH_BLACKLIST}"
+	then
+		echo '# Listing local branches'
+		processBranches_localBranches=$(getBranchList "${WORKER_REPOSITORY_DIR}")
+		echo '# Determining destination branches'
+		for processBranches_localBranch in ${processBranches_localBranches}
+		do
+			processBranches_pushBranch=$(getPushLocalBranch "${processBranches_localBranch}")
+			if stringPassesLists "${processBranches_localBranch}" "${LOCAL_BRANCH_WHITELIST}" "${LOCAL_BRANCH_BLACKLIST} rx:filter-branch/.*"
+			then
+				if test "${processBranches_localBranch}" != "${processBranches_pushBranch}"
+				then
+					echo "# Pushing local branch ${processBranches_localBranch} to ${processBranches_pushBranch}"
+				else
+					echo "# Pushing local branch ${processBranches_localBranch}"
+				fi
+				processBranches_pushRefSpec="${processBranches_pushRefSpec} ${processBranches_localBranch}:${processBranches_pushBranch}"
+			fi
+		done
+	fi
+	if test -n "${processBranches_pushRefSpec}"
+	then
+		echo "# Pushing to destination repository"
+		# shellcheck disable=SC2086
+		git -C "${WORKER_REPOSITORY_DIR}" push --force ${ATOMIC} destination ${processBranches_pushRefSpec}
+	fi
 }
 
 
@@ -940,7 +1177,7 @@ processBranches () {
 #   - Empty string if no tag should be removed
 #   - Space-separated list (including a final extra space) of full tag paths (refs/tags/...) otherwise
 getPruneTags () {
-    getPruneTags_PUSH_TAG_REGEX=$(echo "${PUSH_TAG_FORMAT}" | sed -E 's:%s:(.*):g')
+	getPruneTags_PUSH_TAG_REGEX=$(echo "${PUSH_TAG_FORMAT}" | sed -E 's:%s:(.*):g')
 	getPruneTags_remoteTags=$(git -C "${WORKER_REPOSITORY_DIR}" ls-remote --quiet --tags destination |  grep -Ev '\^\{\}$' | tr '\t' ' ' | sed -nE "s|^.* refs/tags/${getPruneTags_PUSH_TAG_REGEX}\$|\1|p")
 	if test -z "${getPruneTags_remoteTags}"
 	then
@@ -959,7 +1196,7 @@ getPruneTags () {
 		fi
 		if test ${getPruneTags_doDelete} -eq 1
 		then
-            getPruneTags_pushTag=$(getPushTag "${getPruneTags_remoteTag}")
+			getPruneTags_pushTag=$(getPushTag "${getPruneTags_remoteTag}")
 			printf 'refs/tags/%s ' "${getPruneTags_pushTag}"
 		fi
 	done
@@ -969,7 +1206,7 @@ getPruneTags () {
 # Delete in destination repository the non converted branches
 getPruneBranches () {
 	getPruneBranches_currentBranch=''
-    getPruneBranches_PUSH_BRANCH_REGEX=$(echo "${PUSH_BRANCH_FORMAT}" | sed -E 's:%s:(.*):g')
+	getPruneBranches_PUSH_BRANCH_REGEX=$(echo "${PUSH_BRANCH_FORMAT}" | sed -E 's:%s:(.*):g')
 	getPruneBranches_remoteBranches=$(git -C "${WORKER_REPOSITORY_DIR}" ls-remote --quiet --heads destination | tr '\t' ' ' | sed -nE "s|^.* refs/heads/${getPruneBranches_PUSH_BRANCH_REGEX}\$|\1|p")
 	for getPruneBranches_remoteBranch in ${getPruneBranches_remoteBranches}
 	do
@@ -979,7 +1216,7 @@ getPruneBranches () {
 			then
 				getPruneBranches_currentBranch="$(git -C "${WORKER_REPOSITORY_DIR}" ls-remote --symref destination HEAD | head -1 | sed -E 's_^ref: +refs/heads/__' | cut -f 1 | cut -d ' ' -f 1)"
 			fi
-            getPruneBranches_pushBranch=$(getPushBranch "${getPruneBranches_remoteBranch}")
+			getPruneBranches_pushBranch=$(getPushBranch "${getPruneBranches_remoteBranch}")
 			if test "${getPruneBranches_currentBranch}" = "${getPruneBranches_pushBranch}"
 			then
 				printf 'Remote branch %s will NOT be deleted since it is the current one\n' "${getPruneBranches_remoteBranch}" >&2
@@ -1034,6 +1271,20 @@ getMD5 () {
 }
 
 
+# Calculate the basename of a file/url (without directory and extension)
+#
+# Arguments:
+#   $1: the file path or url
+#
+# Output:
+#   The basename of $1
+getBaseName () {
+	getBaseName_r="${1##*/}"
+	getBaseName_r="${getBaseName_r%.*}"
+	printf '%s' "${getBaseName_r}"
+}
+
+
 # Check if a string is in a list (separated by spaces, tabs or new lines)
 #
 # Arguments:
@@ -1059,8 +1310,13 @@ readParameters "$@"
 shift ${ARGS_SHIFT}
 checkEnvironment
 initializeEnvironment
-acquireLock
 prepareLocalSourceRepository
+if test "${PULL_SOURCE_ONLY}" -ne 0
+then
+	echo "${SOURCE_REPOSITORY_DIR}"
+	exit 0
+fi
+acquireLock
 getSourceRepositoryBranches
 getBranchesToProcess
 prepareWorkerRepository
