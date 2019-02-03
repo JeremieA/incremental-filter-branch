@@ -30,8 +30,8 @@ Get the script and read the syntax using the `--help` option.
     --tag-blacklist 'rx:5\..*' \
     --tags-plan all --tags-max-history-lookup 10 \
     https://github.com/concrete5/concrete5.git \
-    '--prune-empty --subdirectory-filter concrete' \
-    git@github.com:concrete5/concrete5-core.git
+    git@github.com:concrete5/concrete5-core.git \
+    --prune-empty --subdirectory-filter concrete
 ```
 
 
